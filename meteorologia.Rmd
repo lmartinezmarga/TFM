@@ -1,0 +1,492 @@
+---
+title: "meteorologia"
+author: "Lucía Martinez Maragreto"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(sf)
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(corrplot)
+library(ggplot2)
+library(openair)
+```
+
+Es carreguen les capes d’estacions meteorològiques, dades meteorològiques diàries i registres d’incendis forestals.
+
+```{r}
+est <- st_read("dades/processades/estacions_utm31n.gpkg")
+meteo <- read_parquet("dades/processades/meteorologia.parquet")
+inc <- st_read("dades/processades/incendis_2000_2024.gpkg")
+```
+
+S’obtenen els punts centrals dels polígons d’incendi per facilitar la relació espacial amb les estacions.
+
+```{r}
+inc_centroid <- st_centroid(inc)
+```
+
+S’identifica l’estació meteorològica activa més propera a cada incendi segons la data d’ocurrència.
+
+```{r}
+inc_centroid$ID_EST <- NA_character_
+
+dates_incendi <- sort(unique(inc_centroid$DATA_INCEN))
+
+for (d in dates_incendi) {
+
+  idx_inc <- which(inc_centroid$DATA_INCEN == d)
+  inc_d   <- inc_centroid[idx_inc, ]
+
+  est_d <- est %>%
+    filter(DATA_ALTA <= d,
+      is.na(DATA_BAIXA) | DATA_BAIXA >= d)
+
+  if (nrow(est_d) == 0) next
+
+  idx_est <- st_nearest_feature(inc_d, est_d)
+
+  inc_centroid$ID_EST[idx_inc] <- est_d$CODI_ESTACIO[idx_est]
+}
+```
+
+Les dades es transformen a format ample per disposar d’una columna per cada variable meteorològica.
+
+```{r}
+meteo_wide <- meteo %>%
+  select(CODI_ESTACIO, DATA_LECTURA, CODI_VARIABLE, VALOR) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = CODI_VARIABLE,
+    values_from = VALOR
+  )
+```
+
+S’uneixen els incendis amb les mesures meteorològiques corresponents al dia i a l’estació assignada.
+
+```{r}
+inc_meteo_sf <- inc_centroid %>%
+  left_join(
+    meteo_wide,
+    by = c("ID_EST" = "CODI_ESTACIO", "DATA_INCEN" = "DATA_LECTURA")
+  ) %>%
+  mutate(INCENDI = 1) %>%
+  rename(DATA = DATA_INCEN) %>%
+  select(-CODI_FINAL, -MUNICIPI, -ID_EST)
+
+inc_meteo <- inc_meteo_sf %>% st_drop_geometry()
+```
+
+S’obté l’àrea de Catalunya excloent les zones afectades per incendis per simular condicions sense incendi.
+
+```{r}
+lim_cat <- st_read("dades/crues/divisions_admin/catalunya.gpkg")
+st_crs(lim_cat) <- 25831
+
+inc_union <- st_union(inc)
+cat_sense_incendis <- st_difference(lim_cat, inc_union)
+```
+
+S’extreu un conjunt de punts aleatoris dins les zones sense incendi per representar dies sense incidència.
+
+```{r}
+n_no_incendis <- nrow(inc_meteo) * 3
+
+set.seed(05052024)
+punts_aleatoris <- st_sample(
+  cat_sense_incendis,
+  size = n_no_incendis,
+  type = "random"
+) %>% 
+  st_sf() %>%
+  st_set_crs(25831)
+```
+
+S’assigna una data aleatòria dins del període d’estudi a cada punt del conjunt aleatori.
+
+```{r}
+dates_possibles <- seq(as.Date("2000-01-01"), as.Date("2024-12-31"), by = "day")
+set.seed(05052024)
+punts_aleatoris$DATA <- sample(dates_possibles, size = n_no_incendis, replace = TRUE)
+```
+
+S’identifica l’estació meteorològica activa més propera a cada punt segons la data assignada.
+
+```{r}
+punts_aleatoris$ID_EST <- NA_character_
+
+dates_punts <- sort(unique(punts_aleatoris$DATA))
+
+for (d in dates_punts) {
+
+  idx_p <- which(punts_aleatoris$DATA == d)
+  punts_d <- punts_aleatoris[idx_p, ]
+
+  est_d <- est %>% 
+    filter(DATA_ALTA <= d & DATA_BAIXA >= d)
+
+  if (nrow(est_d) == 0) next
+
+  idx_est <- st_nearest_feature(punts_d, est_d)
+
+  punts_aleatoris$ID_EST[idx_p] <- est_d$CODI_ESTACIO[idx_est]
+}
+```
+
+Es determina la temporada de l’any associada a cada data.
+
+```{r}
+estacio_any <- function(date) {
+  md <- month(date)*100 + day(date)
+  case_when(
+    between(md, 321, 620) ~ "Primavera",
+    between(md, 621, 922) ~ "Estiu",
+    between(md, 923, 1220) ~ "Tardor",
+    TRUE ~ "Hivern"
+  )
+}
+```
+
+S’associen les dades meteorològiques als punts sense incendi i s’afegeixen variables temporals.
+
+```{r}
+no_inc_meteo_sf <- punts_aleatoris %>%
+  left_join(
+    meteo_wide,
+    by = c("ID_EST" = "CODI_ESTACIO", "DATA" = "DATA_LECTURA")
+  ) %>%
+  mutate(
+    INCENDI = 0,
+    DIA = day(DATA),
+    MES = month(DATA),
+    ANY = year(DATA),
+    DIA_SETMANA = factor(
+      wday(DATA, week_start = 1),
+      levels = 1:7,
+      labels = c("dilluns", "dimarts", "dimecres", "dijous",
+                 "divendres", "dissabte", "diumenge")
+      ),
+    TEMPORADA = estacio_any(DATA),
+    HA_CREMADES = 0
+  ) %>%
+  rename(geom = geometry) %>%
+  select(-ID_EST)
+
+no_inc_meteo <- no_inc_meteo_sf %>% st_drop_geometry()
+```
+
+S’integren les observacions amb incendi i sense en un únic conjunt de dades per a l’anàlisi conjunta.
+
+```{r}
+dataset_final <- bind_rows(inc_meteo, no_inc_meteo)
+```
+
+Es crea una versió espacial per a possibles anàlisis geogràfiques.
+
+```{r}
+sf_final <- bind_rows(inc_meteo_sf, no_inc_meteo_sf)
+```
+
+S’analitza la relació mensual entre el nombre d’incendis i la temperatura màxima mitjana.
+
+```{r}
+inc_mes <- inc_meteo %>%
+  group_by(MES) %>%
+  summarise(
+    n_incendis = n(),
+    temp_max_mitjana = mean(`1001`, na.rm = TRUE)
+  )
+
+ggplot(inc_mes, aes(x = MES)) +
+  geom_col(aes(y = n_incendis)) +
+  geom_line(aes(y = temp_max_mitjana * 5), linewidth = 1) +
+  scale_y_continuous(
+    name = "Nombre d'incendis",
+    sec.axis = sec_axis(~./5, name = "Temperatura màxima (ºC)")
+  ) +
+  labs(
+    title = "Relació mensual entre incendis i temperatura màxima"
+  ) +
+  theme_minimal()
+```
+
+Se seleccionen les variables meteorològiques d’interès i es converteixen a format numèric.
+
+```{r}
+vars_meteo <- c("1001", "1102", "1300", "1400", "1503", "1512", "1515", "1700")
+meteo_data <- dataset_final %>%
+  select(all_of(vars_meteo)) %>%
+  mutate(across(everything(), as.numeric))
+```
+
+Es calcula la matriu de correlacions utilitzant observacions completes per parelles.
+ 
+```{r}
+matriu_cor <- cor(meteo_data, use = "pairwise.complete.obs")
+print(matriu_cor)
+```
+
+Es representa gràficament la matriu de correlacions mitjançant diagrames el·líptics.
+
+```{r}
+corrplot(matriu_cor, method = "ellipse", type = "upper", tl.cex = 0.6, number.cex = 0.6)
+```
+
+Es calculen i es visualitzen les correlacions en dies amb incendi i en dies sense incendi.
+
+```{r}
+cor_inc <- dataset_final %>%
+  filter(INCENDI == 1) %>%
+  select(all_of(vars_meteo)) %>%
+  cor(use = "pairwise.complete.obs")
+
+corrplot(cor_inc, title = "Correlacions en dies amb incendi", mar = c(0,0,2,0), method = "ellipse", type = "upper", tl.cex = 0.6, number.cex = 0.6)
+```
+
+```{r}
+cor_no_inc <- dataset_final %>%
+  filter(INCENDI == 0) %>%
+  select(all_of(vars_meteo)) %>%
+  cor(use = "pairwise.complete.obs")
+
+corrplot(cor_no_inc, title = "Correlacions en dies sense incendi", mar = c(0,0,2,0), method = "ellipse", type = "upper", tl.cex = 0.6, number.cex = 0.6)
+```
+
+S’obtenen les mitjanes de les variables meteorològiques agrupades segons la presència d’incendi.
+
+```{r}
+dataset_final %>%
+  group_by(INCENDI) %>%
+  summarise(
+    temp_max = mean(`1001`, na.rm = TRUE),
+    hum_min = mean(`1102`, na.rm = TRUE),
+    prec = mean(`1300`, na.rm = TRUE),
+    irradiacio = mean(`1400`, na.rm = TRUE),
+    vent = mean(`1503`, na.rm = TRUE),
+    ratxa = mean(`1512`, na.rm = TRUE),
+    evapo = mean(`1700`, na.rm = TRUE)
+  )
+```
+
+Es representa la distribució de la temperatura màxima en dies amb incendi.
+
+```{r}
+ggplot(
+  dataset_final %>% filter(INCENDI == 1),
+  aes(x = `1001`)
+) +
+  geom_histogram(bins = 30) +
+  labs(
+    x = "Temperatura màxima (°C)",
+    y = "Nombre d'incendis",
+    title = "Distribució de la temperatura màxima en dies amb incendi"
+  ) +
+  theme_minimal()
+```
+
+Es compara la distribució de la temperatura màxima entre dies amb incendi i sense.
+
+```{r}
+ggplot(dataset_final, aes(x = `1001`, fill = factor(INCENDI))) +
+  geom_density(alpha = 0.9) +
+  scale_fill_brewer(
+    palette = "Reds",
+    direction = 1,
+    labels = c("No incendi", "Incendi")
+  ) +
+  labs(
+    x = "Temperatura màxima (°C)",
+    y = "Densitat",
+    fill = "",
+    title = "Distribució de la temperatura màxima segons presència d’incendi"
+  ) +
+  theme_minimal()
+```
+
+S’avaluen les diferències de temperatura màxima entre dies amb incendi i sense.
+
+```{r}
+ggplot(dataset_final, aes(x = factor(INCENDI), y = `1001`)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("No incendi", "Incendi")) +
+  labs(
+    x = "",
+    y = "Temperatura màxima (°C)",
+    title = "Comparació de temperatura màxima entre dies amb incendi i sense"
+  ) +
+  theme_minimal()
+```
+
+S’estudia la variació de la temperatura màxima per temporada i presència d’incendi.
+
+```{r}
+ggplot(dataset_final, aes(x = TEMPORADA, y = `1001`, fill = factor(INCENDI))) +
+  geom_boxplot() +
+  scale_fill_brewer(
+    palette = "Reds",
+    direction = 1,
+    labels = c("No incendi", "Incendi")
+  ) +
+  labs(
+    x = "Temporada",
+    y = "Temperatura màxima (°C)",
+    fill = "",
+    title = "Temperatura màxima per temporada i presència d’incendi"
+  ) +
+  theme_minimal()
+```
+
+S’examinen les diferències de precipitació acumulada entre dies amb incendi i sense.
+
+```{r}
+ggplot(dataset_final, aes(x = factor(INCENDI), y = `1300`)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("No incendi", "Incendi")) +
+  labs(
+    x = "",
+    y = "Precipitació acumulada (mm)",
+    title = "Comparació de la precipitació acumulada entre dies amb incendi i sense"
+  ) +
+  theme_minimal()
+```
+
+Es calcula el percentatge de dies sense precipitació segons la presència d’incendi.
+
+```{r}
+dataset_final %>%
+  mutate(sec = `1300` == 0) %>%
+  group_by(INCENDI) %>%
+  summarise(percent_sec = mean(sec, na.rm = TRUE) * 100)
+```
+
+Es compara la precipitació acumulada en dies amb pluja segons la presència d’incendi.
+
+```{r}
+ggplot(
+  dataset_final %>% filter(`1300` > 0),
+  aes(x = factor(INCENDI), y = `1300`)
+) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("No incendi", "Incendi")) +
+  labs(
+    x = "",
+    y = "Precipitació acumulada (mm)",
+    title = "Precipitació acumulada en dies amb pluja"
+  ) +
+  theme_minimal()
+```
+
+S’examinen les diferències en humitat, irradiació, vent i evapotranspiració entre dies amb incendi i sense.
+
+```{r}
+ggplot(dataset_final, aes(x = factor(INCENDI), y = `1102`)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("No incendi", "Incendi")) +
+  labs(
+    x = "",
+    y = "Humitat relativa mínima (%)",
+    title = "Comparació de la humitat relativa mínima entre dies amb incendi i sense"
+  ) +
+  theme_minimal()
+
+ggplot(dataset_final, aes(x = factor(INCENDI), y = `1400`)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("No incendi", "Incendi")) +
+  labs(
+    x = "",
+    y = "Irradiació solar global (MJ/m²)",
+    title = "Comparació de la irradiació solar global entre dies amb incendi i sense"
+  ) +
+  theme_minimal()
+
+ggplot(dataset_final, aes(x = factor(INCENDI), y = `1503`)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("No incendi", "Incendi")) +
+  labs(
+    x = "",
+    y = "Velocitat mitjana del vent (m/s)",
+    title = "Comparació de la velocitat mitjana del vent entre dies amb incendi i sense"
+  ) +
+  theme_minimal()
+
+ggplot(dataset_final, aes(x = factor(INCENDI), y = `1700`)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("No incendi", "Incendi")) +
+  labs(
+    x = "",
+    y = "Evapotranspiració de referència",
+    title = "Comparació de l'evapotranspiració de referència entre dies amb incendi i sense"
+  ) +
+  theme_minimal()
+```
+
+Es classifica la direcció del vent en sectors cardinals.
+
+```{r}
+dataset_final <- dataset_final %>%
+  mutate(
+    dir_cat = cut(`1515`,
+      breaks = c(-22.5, 22.5, 67.5, 112.5, 157.5, 202.5, 247.5, 292.5, 337.5, 382.5),
+      labels = c("N","NE","E","SE","S","SW","W","NW","N"),
+      include.lowest = TRUE
+    )
+  )
+```
+
+S’estudia la freqüència de les direccions del vent en dies amb incendi.
+
+```{r}
+dataset_final %>%
+  filter(INCENDI == 1) %>%
+  count(dir_cat) %>%
+  ggplot(aes(x = dir_cat, y = n)) +
+  geom_col() +
+  labs(
+    x = "Direcció del vent",
+    y = "Nombre d'incendis",
+    title = "Direcció del vent en dies amb incendi"
+  ) +
+  theme_minimal()
+```
+
+Es visualitza la distribució conjunta de la velocitat i direcció del vent segons la presència d’incendi.
+
+```{r}
+windRose(
+  dataset_final,
+  ws = "1503",  # velocitat
+  wd = "1515",  # direcció
+  type = "INCENDI",
+  cols = c("steelblue", "firebrick")
+)
+```
+
+Es compara la velocitat del vent segons la direcció i la presència d’incendi.
+
+```{r}
+ggplot(dataset_final, aes(x = dir_cat, y = `1503`, fill = factor(INCENDI))) +
+  geom_boxplot() +
+  scale_fill_brewer(
+    palette = "Reds",
+    direction = 1,
+    labels = c("No incendi", "Incendi")
+  ) +
+  labs(
+    x = "Direcció del vent",
+    y = "Velocitat del vent (m/s)",
+    fill = "",
+    title = "Velocitat del vent segons direcció i presència d’incendi"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+st_write(sf_final, "dades/processades/sf_final.gpkg", delete_dsn = TRUE)
+```

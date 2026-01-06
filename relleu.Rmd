@@ -1,0 +1,146 @@
+---
+title: "relleu"
+author: "Lucía Martinez Maragreto"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(terra)
+```
+
+Es carreguen les dades espacials combinades (incendis i meteorologia) i els mapes raster d’altitud, pendent i orientació.
+
+```{r}
+sf_final <- st_read("dades/processades/sf_final.gpkg")
+mde <- rast("dades/processades/MDT5x5.tif")
+pendent <- rast("dades/processades/pendent.tif")
+orientacio <- rast("dades/processades/orientacio.tif")
+```
+
+S’extrau l’altitud, el pendent i l'orientació per a cada punt del conjunt espacial, utilitzant les dades raster.
+
+```{r}
+sf_final$altitud <- extract(mde, vect(sf_final))[,2]
+sf_final$pendent <- extract(pendent, vect(sf_final))[,2]
+sf_final$orientacio <- extract(orientacio, vect(sf_final))[,2]
+```
+
+S’obtenen estadístiques descriptives bàsiques per les variables altitud, pendent i orientació.
+
+```{r}
+summary(sf_final$altitud)
+summary(sf_final$pendent)
+summary(sf_final$orientacio)
+```
+
+Les variables altitud i pendent es transformen en categories per trams, i l’orientació es reclassifica en quatre sectors: Nord, Est, Sud i Oest.
+
+```{r}
+sf_final <- sf_final %>%
+  mutate(
+    altitud_cat = cut(
+      altitud,
+      breaks = c(0, 200, 500, 800, 1200, Inf),
+      labels = c("<200", "200–500", "500–800", "800–1200", ">1200")
+    ),
+    pendent_cat = cut(
+      pendent,
+      breaks = c(0, 5, 15, 30, 45, Inf),
+      labels = c("0–5º", "5–15º", "15–30º", "30–45º", ">45º")
+    ),
+    orientacio_cat = case_when(
+      orientacio >= 315 | orientacio < 45  ~ "Nord",
+      orientacio >= 45  & orientacio < 135 ~ "Est",
+      orientacio >= 135 & orientacio < 225 ~ "Sud",
+      orientacio >= 225 & orientacio < 315 ~ "Oest"
+    )
+  )
+```
+
+Es representa el nombre d’incendis per franges altitudinals, comparant dies amb incendi  i sense.
+
+```{r}
+sf_final %>%
+  st_drop_geometry() %>%
+  group_by(altitud_cat, INCENDI) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  ggplot(aes(altitud_cat, n, fill = factor(INCENDI))) +
+  geom_col(position = "dodge") +
+  scale_fill_brewer(
+    palette = "Reds",
+    direction = 1,
+    labels = c("No incendi", "Incendi")
+  ) +
+  labs(
+    title = "Nombre d'incendis segons franja altitudinal",
+    x = "Elevació (m)",
+    fill = ""
+  ) +
+  theme_minimal()
+```
+
+S’analitza la probabilitat mitjana d’incendi en funció del pendent del terreny.
+
+```{r}
+sf_final %>%
+  st_drop_geometry() %>%
+  group_by(pendent_cat) %>%
+  summarise(
+    prob_incendi = mean(INCENDI),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(pendent_cat, prob_incendi)) +
+  geom_col() +
+  labs(
+    title = "Probabilitat d'incendi segons pendent",
+    x = "Pendent",
+    y = "Probabilitat d'incendi"
+  ) +
+  theme_minimal()
+```
+
+S’estudia la relació entre la orientació del pendent i la probabilitat d’incendi.
+
+```{r}
+sf_final %>%
+  st_drop_geometry() %>%
+  group_by(orientacio_cat) %>%
+  summarise(
+    prob_incendi = mean(INCENDI),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(orientacio_cat, prob_incendi)) +
+  geom_col() +
+  labs(
+    title = "Probabilitat d'incendi segons orientació",
+    x = "Orientació",
+    y = "Probabilitat d'incendi"
+  ) +
+  theme_minimal()
+```
+
+S’apliquen tests de Wilcoxon per comparar distribucions de variables de relleu entre dies amb incendi  i sense.
+
+```{r}
+wilcox.test(altitud ~ INCENDI, data = sf_final)
+wilcox.test(pendent ~ INCENDI, data = sf_final)
+wilcox.test(orientacio ~ INCENDI, data = sf_final)
+```
+
+S’ajusta un model lineal generalitzat per explicar la presència d’incendis a partir de les variables de relleu.
+
+```{r}
+model_relleu <- glm(
+  INCENDI ~ altitud + pendent + orientacio,
+  data = sf_final,
+  family = binomial
+)
+summary(model_relleu)
+```

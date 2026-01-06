@@ -1,0 +1,200 @@
+---
+title: "cobertes"
+author: "Lucía Martinez Maragreto"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(sf)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+Es carreguen les capes de cobertes del sòl reclassificades corresponents a diferents anys.
+
+```{r}
+cob2009 <- st_read("dades/processades/cobertes_sol/cobertes-sol-v1r0-2009-reclas.gpkg")
+cob2018 <- st_read("dades/processades/cobertes_sol/cobertes-sol-v1r0-2018-reclas.gpkg")
+cob2019_2022 <- st_read("dades/processades/cobertes_sol/cobertes-sol-v1r0-2019-2022-reclas.gpkg")
+cob2023 <- st_read("dades/processades/cobertes_sol/cobertes-sol-v1r0-2023-reclas.gpkg")
+```
+
+S’afegeix un identificador únic als punts i se seleccionen les variables essencials per a l’anàlisi espacial.
+
+```{r}
+sf_final <- st_read("dades/processades/sf_final.gpkg")
+sf_final$ID <- 1:nrow(sf_final)
+sf_curt <- sf_final %>% select(ID, INCENDI, ANY, geom)
+```
+
+Se simplifiquen les geometries de les cobertes del sòl per reduir el cost computacional de les interseccions.
+
+```{r}
+cob2009_simple <- st_simplify(cob2009, dTolerance = 50)
+cob2018_simple <- st_simplify(cob2018, dTolerance = 50)
+cob2019_2022_simple <- st_simplify(cob2019_2022, dTolerance = 50)
+cob2023_simple <- st_simplify(cob2023, dTolerance = 50)
+```
+
+S’organitzen les capes de cobertes en una llista per facilitar-ne la selecció segons l’any d’estudi.
+
+```{r}
+cobertes <- list(
+  "2009" = cob2009_simple,
+  "2018" = cob2018_simple,
+  "2022" = cob2019_2022_simple,
+  "2023" = cob2023_simple
+)
+```
+
+Es defineix una funció que retorna la capa de cobertes adequada en funció de l’any del punt.
+
+```{r}
+get_coberta <- function(any) {
+  if (any <= 2009) cobertes[["2009"]]
+  else if (any <= 2018) cobertes[["2018"]]
+  else if (any <= 2022) cobertes[["2022"]]
+  else cobertes[["2023"]]
+}
+```
+
+Es calcula, per a cada any, la proporció de cada tipus de coberta del sòl dins d’un buffer de 500 metres al voltant del punt.
+
+```{r}
+resultats <- list()
+
+for (any in sort(unique(sf_curt$ANY))) {
+
+  message("Processant any: ", any)
+
+  punts_any <- sf_curt %>% filter(ANY == any)
+  buf_any <- st_buffer(punts_any, 500)
+
+  cob_any <- get_coberta(any)
+
+  inter <- st_intersection(buf_any, cob_any)
+  inter$area <- st_area(inter)
+  
+  res_any <- inter %>%
+    st_drop_geometry() %>%
+    group_by(ID, TIPUS) %>%
+    summarise(area = sum(area), .groups = "drop") %>%
+    group_by(ID) %>%
+    mutate(pct = area / sum(area)) %>%
+    ungroup()
+
+
+  resultats[[as.character(any)]] <- res_any
+}
+```
+
+Es combinen els resultats anuals i es transformen en format ample.
+
+```{r}
+resultats_cobertes <- bind_rows(resultats) %>% 
+  mutate(pct = as.numeric(pct))
+
+resultats_wide <- resultats_cobertes %>%
+  select(ID, TIPUS, pct) %>%
+  pivot_wider(
+    names_from = TIPUS,
+    values_from = pct,
+    values_fill = 0
+  )
+
+punts_final <- sf_curt %>%
+  left_join(resultats_wide, by = "ID")
+```
+
+Es repeteix el procediment d’intersecció espacial per obtenir les proporcions segons el tipus de combustible.
+
+```{r}
+resultats2 <- list()
+
+for (any in sort(unique(sf_curt$ANY))) {
+
+  message("Processant any: ", any)
+
+  punts_any <- sf_curt %>% filter(ANY == any)
+  buf_any <- st_buffer(punts_any, 500)
+
+  cob_any <- get_coberta(any)
+
+  inter <- st_intersection(buf_any, cob_any)
+  inter$area <- st_area(inter)
+
+  res_any <- inter %>%
+    st_drop_geometry() %>%
+    group_by(ID, COMBUST) %>%
+    summarise(area = sum(area), .groups = "drop") %>%
+    group_by(ID) %>%
+    mutate(pct = area / sum(area)) %>%
+    ungroup()
+
+
+  resultats2[[as.character(any)]] <- res_any
+}
+```
+
+Es genera una taula amb els percentatges de superfície per tipus de combustible associats a cada punt.
+
+```{r}
+resultats_cobertes2 <- bind_rows(resultats2) %>% 
+  mutate(pct = as.numeric(pct))
+
+resultats_wide2 <- resultats_cobertes2 %>%
+  select(ID, COMBUST, pct) %>%
+  pivot_wider(
+    names_from = COMBUST,
+    values_from = pct,
+    values_fill = 0
+  )
+
+punts_final2 <- sf_curt %>%
+  left_join(resultats_wide2, by = "ID")
+```
+
+Es compara la composició mitjana de les cobertes del sòl entre punts amb incendi i sense.
+
+```{r}
+punts_final %>%
+  st_drop_geometry() %>%
+  select(INCENDI, Forest_obert, Forest_tancat, Herbaci, Sense_vegetació,
+         Agrícola, Infraestructures, Aigua) %>%
+  pivot_longer(-INCENDI, names_to = "Coberta", values_to = "pct") %>%
+  ggplot(aes(Coberta, pct, fill = factor(INCENDI))) +
+  stat_summary(fun = mean, geom = "col", position = "dodge") +
+  scale_fill_brewer(palette = "Reds", direction = 1,
+                    labels = c("No incendi", "Incendi")) +
+  labs(
+    title = "Cobertes del sòl segons presència d'incendi",
+    fill = "",
+    y = "Percentatge mitjà (buffer 500 m)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+Es representa el percentatge mitjà de cada tipus de combustible en funció de la presència d’incendi.
+
+```{r}
+punts_final2 %>%
+  st_drop_geometry() %>%
+  select(INCENDI, Alta, Mitjana, No_comb, Baixa) %>%
+  pivot_longer(-INCENDI, names_to = "Coberta", values_to = "pct") %>%
+  ggplot(aes(Coberta, pct, fill = factor(INCENDI))) +
+  stat_summary(fun = mean, geom = "col", position = "dodge") +
+  scale_fill_brewer(palette = "Reds", direction = 1,
+                    labels = c("No incendi", "Incendi")) +
+  labs(
+    title = "Cobertes del sòl segons presència d'incendi",
+    fill = "",
+    y = "Percentatge mitjà (buffer 500 m)"
+  ) +
+  theme_minimal()
+```
