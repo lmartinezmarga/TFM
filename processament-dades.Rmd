@@ -1,0 +1,469 @@
+---
+title: "processament-dades"
+author: "Lucía Martinez Margareto"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(sf)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(httr)
+library(jsonlite)
+library(purrr)
+library(terra)
+library(utils)
+library(arrow)
+```
+
+## Incendis
+
+Es llisten, es descomprimeixen i es combinen els fitxers d’incendis forestals en un únic objecte espacial.
+
+```{r}
+zips <- list.files("dades/crues/incendis_forestals", pattern = "\\.zip$",
+                   full.names = TRUE)
+
+temp_dir <- tempdir()
+for (z in zips) {
+  unzip(z, exdir = temp_dir)
+}
+
+shps <- list.files(temp_dir, pattern = "\\.shp$", full.names = TRUE)
+llista_sf <- lapply(shps, st_read, quiet = TRUE)
+incendis <- bind_rows(llista_sf)
+```
+
+Es neteja el camp de data i es transforma a format Date, eliminant els registres sense informació temporal vàlida.
+
+```{r}
+incendis <- incendis %>%
+  mutate(
+    DATA_INCEN = str_trim(str_split(DATA_INCEN, "\r", simplify = TRUE)[,1]),
+    DATA_INCEN = dmy(DATA_INCEN, quiet = TRUE)
+  ) %>%
+  filter(!is.na(DATA_INCEN))
+```
+
+Es valida i s’unifica la geometria dels polígons per garantir la consistència espacial.
+
+```{r}
+st_geometry_type(incendis) %>% table()
+
+incendis <- incendis %>%
+  st_make_valid() %>%
+  st_cast("MULTIPOLYGON")
+```
+
+Es deriven atributs temporals i es calcula la superfície cremada per a cada incendi.
+
+```{r}
+estacio_any <- function(date) {
+  md <- month(date)*100 + day(date)
+  case_when(
+    between(md, 321, 620) ~ "Primavera",
+    between(md, 621, 922) ~ "Estiu",
+    between(md, 923, 1220) ~ "Tardor",
+    TRUE ~ "Hivern"
+  )
+}
+
+incendis <- incendis %>%
+  mutate(
+    DIA = day(DATA_INCEN),
+    MES = month(DATA_INCEN),
+    ANY = year(DATA_INCEN),
+    DIA_SETMANA = factor(
+      wday(DATA_INCEN, week_start = 1),
+      levels = 1:7,
+      labels = c("dilluns", "dimarts", "dimecres", "dijous",
+                 "divendres", "dissabte", "diumenge")
+      ),
+    TEMPORADA = factor(estacio_any(DATA_INCEN)),
+    HA_CREMADES = as.numeric(st_area(geometry)) / 10000
+  )
+```
+
+```{r}
+incendis <- incendis %>% 
+  distinct(DATA_INCEN, geometry, .keep_all = TRUE) %>%
+  dplyr::select(-GRID_CODE, -OBJECTID)
+st_crs(incendis)
+str(incendis)
+```
+
+```{r}
+if (file.exists("dades/processades/incendis_2000_2024.gpkg"))
+  file.remove("dades/processades/incendis_2000_2024.gpkg")
+st_write(incendis, "dades/processades/incendis_2000_2024.gpkg")
+```
+
+## Divisions administratives
+
+Es descarreguen les divisions administratives a través d’un servei WFS i es carreguen com a capes espacials.
+
+```{r}
+wfs_url <- "https://geoserveis.icgc.cat/servei/catalunya/divisions-administratives/wfs?service=wfs&version=2.0.0&request=GetCapabilities"
+
+# Municipis (polígons)
+municipis <- st_read(
+  dsn = wfs_url,
+  layer = "divisions_administratives_wfs:divisions_administratives_municipis_50000"
+)
+
+# Capitals de municipis (punts)
+caps_municipi <- st_read(
+  dsn = wfs_url,
+  layer = "divisions_administratives_wfs:divisions_administratives_capsdemunicipi_capmunicipi"
+)
+
+# Comarques (polígons)
+comarques <- st_read(
+  dsn = wfs_url,
+  layer = "divisions_administratives_wfs:divisions_administratives_comarques_50000"
+)
+
+# Capitals de comarques (punts)
+caps_comarca <- st_read(
+  dsn = wfs_url,
+  layer = "divisions_administratives_wfs:divisions_administratives_capsdemunicipi_capcomarca"
+)
+
+# Províncies (polígons)
+provincies <- st_read(
+  dsn = wfs_url,
+  layer = "divisions_administratives_wfs:divisions_administratives_provincies_50000"
+)
+```
+
+Guardat cru en GPKG
+
+```{r}
+datasets <- list(
+  municipis = municipis,
+  caps_municipi = caps_municipi,
+  comarques = comarques,
+  caps_comarca = caps_comarca,
+  provincies = provincies)
+
+for (nm in names(datasets)) {
+  st_write(datasets[[nm]], paste0("dades/crues/divisions_admin/", nm, ".gpkg"),
+           layer = nm, delete_layer = TRUE)
+}
+```
+
+Se seleccionen únicament les variables rellevants per reduir la complexitat dels conjunts de dades.
+
+```{r}
+municipis_norm <- municipis %>% 
+  dplyr::select(CODIMUNI, NOMMUNI, CAPMUNI, CODICOMAR, CODIPROV,
+         SHAPE_Area, SHAPE)
+
+caps_municipi_norm <- caps_municipi %>% 
+  dplyr::select(OBJECTID, NOMCAP, CODIMUNI, SHAPE)
+
+comarques_norm <- comarques %>% 
+  dplyr::select(CODICOMAR, NOMCOMAR, CAPCOMAR, SHAPE_Area,
+         SHAPE)
+
+caps_comarca_norm <- caps_comarca %>% 
+  dplyr::select(OBJECTID, NOMCAP, CODICOMAR, SHAPE)
+
+provincies_norm <- provincies %>% 
+  dplyr::select(CODIPROV, NOMPROV, CAPPROV, SHAPE_Area, SHAPE)
+```
+
+Guardat processat en GPKG
+
+```{r}
+datasets2 <- list(
+  municipis_norm = municipis_norm,
+  caps_municipi_norm = caps_municipi_norm,
+  comarques_norm = comarques_norm,
+  caps_comarca_norm = caps_comarca_norm,
+  provincies_norm = provincies_norm)
+
+for (nm in names(datasets2)) {
+  st_write(datasets2[[nm]], paste0("dades/processades/divisions_admin/", nm, ".gpkg"),
+           layer = nm, delete_layer = TRUE)
+}
+```
+
+## Cremes controlades
+
+Es filtren les cremes controlades dins del període d’estudi i s’eliminen duplicats geomètrics.
+
+```{r}
+cremes <- st_read("dades/crues/cremes/CremesCAT.shp")
+cremes <- cremes %>% 
+  distinct(DATA_CREMA, geometry, .keep_all = TRUE) %>%
+  dplyr::select(DATA_CREMA, HECTARES, geometry) %>%
+  filter(DATA_CREMA > as.Date("1999-12-31"))
+```
+
+```{r}
+if (file.exists("dades/processades/cremes.gpkg"))
+  file.remove("dades/processades/cremes.gpkg")
+st_write(cremes, "dades/processades/cremes.gpkg")
+```
+
+## Estacions meteorològiques
+
+Es netegen els formats, es converteixen les dates i es transforma la geometria al sistema de referència UTM.
+
+```{r}
+estacions <- read.csv("dades/crues/XEMA/estacions.csv", dec = ",")
+estacions$ALTITUD <- gsub("\\.", ",", gsub(",", "", estacions$ALTITUD))
+estacions <- estacions %>%
+  mutate(DATA_ALTA = as.Date(DATA_ALTA, format = "%d/%m/%Y"),
+         DATA_BAIXA = as.Date(DATA_BAIXA, format = "%d/%m/%Y")) %>%
+  distinct() %>%
+  dplyr::select(CODI_ESTACIO, DATA_ALTA, DATA_BAIXA, Georeferència)
+str(estacions)
+
+estacions_sf <- st_sf(estacions, geometry = st_as_sfc(estacions$Georeferència),
+                      crs = 4326)
+estacions_utm31n <- st_transform(estacions_sf, crs = 25831)
+estacions_utm31n <- estacions_utm31n %>%
+  dplyr::select(-Georeferència)
+```
+
+```{r}
+if (file.exists("dades/processades/estacions_utm31n.gpkg"))
+  file.remove("dades/processades/estacions_utm31n.gpkg")
+st_write(estacions_utm31n, "dades/processades/estacions_utm31n.gpkg")
+```
+
+## Meteorologia
+
+Es corregeixen els formats, es transformen les dates i es filtren els registres representatius.
+
+```{r}
+meteorologia <- read.csv("dades/crues/XEMA/meteorologia.csv", dec = ",")
+meteorologia$CODI_VARIABLE <- as.integer(gsub("\\.", "", meteorologia$CODI_VARIABLE))
+meteorologia <- meteorologia %>%
+  mutate(DATA_LECTURA = as.Date(DATA_LECTURA, format = "%d/%m/%Y")) %>%
+  distinct() %>%
+  filter(Estat == "Representatiu") %>%
+  dplyr::select(-NOM_ESTACIO, -UNITAT, -HORA._TU, -Estat)
+str(meteorologia)
+```
+
+```{r}
+if (file.exists("dades/processades/meteorologia.parquet"))
+  file.remove("dades/processades/meteorologia.parquet")
+write_parquet(meteorologia, "dades/processades/meteorologia.parquet")
+```
+
+## Model d’elevacions
+
+Es descomprimeixen, es carreguen i es combinen els fitxers raster per generar un model digital d’elevacions continu. Es descarten els valors negatius que corresponen a zones sota el nivell del mar.
+
+```{r}
+zip_dir <- "dades/crues/mde5x5"
+
+temp_dir <- file.path(tempdir(), "dem_unzip")
+dir.create(temp_dir, showWarnings = FALSE)
+
+zip_files <- list.files(zip_dir, pattern = "\\.zip$", full.names = TRUE)
+
+descomprimir_zip <- function(zip_path, out_dir) {
+  unzip(zip_path, exdir = out_dir)
+}
+
+# Descompressió primer nivell
+for (z in zip_files) {
+  carpeta_zip <- file.path(temp_dir, tools::file_path_sans_ext(basename(z)))
+  dir.create(carpeta_zip, showWarnings = FALSE)
+  descomprimir_zip(z, carpeta_zip)
+}
+
+# Descompressió segon nivell
+zip_files_2 <- list.files(temp_dir, pattern = "\\.zip$", full.names = TRUE, recursive = TRUE)
+
+final_dir <- file.path(temp_dir, "final_txt")
+dir.create(final_dir, showWarnings = FALSE)
+
+for (z2 in zip_files_2) {
+  unzip(z2, exdir = final_dir)
+}
+
+txt_files <- list.files(final_dir, pattern = "\\.txt$", full.names = TRUE)
+rasters <- lapply(txt_files, rast)
+mosaic_dem <- do.call(merge, rasters)
+mosaic_dem[mosaic_dem < 0] <- NA
+```
+
+```{r}
+plot(mosaic_dem, axes = FALSE, main = "Model digital d'elevacions (m)")
+```
+
+```{r}
+writeRaster(mosaic_dem, "dades/processades/MDT5x5.tif", overwrite = TRUE)
+```
+
+## Pendent i orientació
+
+Es deriven les capes de pendent i orientació a partir del model digital d’elevacions.
+
+```{r}
+pendent <- terrain(mosaic_dem, v = "slope", unit = "degrees")
+orientacio <- terrain(mosaic_dem, v = "aspect", unit = "degrees")
+```
+
+```{r}
+plot(pendent, col = rev(hcl.colors(50, "YlOrRd")),
+     axes = FALSE, main = "Pendent (°)")
+```
+
+```{r}
+plot(orientacio, col = hcl.colors(50, "Spectral"),
+     axes = FALSE, main = "Orientació (°)")
+```
+
+```{r}
+writeRaster(pendent, "dades/processades/pendent.tif", overwrite = TRUE)
+writeRaster(orientacio, "dades/processades/orientacio.tif", overwrite = TRUE)
+```
+
+## Cobertes del sòl
+
+S’exploren les capes i es carreguen tant les cobertes del sòl com les seves categories.
+
+```{r}
+st_layers("dades/crues/cobertes_sol/cobertes-sol-v1r0-2009.gpkg")
+st_layers("dades/crues/cobertes_sol/cobertes-sol-v1r0-2018.gpkg")
+st_layers("dades/crues/cobertes_sol/cobertes-sol-v1r0-2019-2022.gpkg")
+st_layers("dades/crues/cobertes_sol/cobertes-sol-v1r0-2023.gpkg")
+```
+
+```{r}
+cobertes2009 <- st_read("dades/crues/cobertes_sol/cobertes-sol-v1r0-2009.gpkg",
+                        layer = "cobertes_sol")
+cobertes2018 <- st_read("dades/crues/cobertes_sol/cobertes-sol-v1r0-2018.gpkg",
+                        layer = "cobertes_sol")
+cobertes2019_2022 <- st_read("dades/crues/cobertes_sol/cobertes-sol-v1r0-2019-2022.gpkg",
+                             layer = "cobertes_sol")
+cobertes2023 <- st_read("dades/crues/cobertes_sol/cobertes-sol-v1r0-2023.gpkg",
+                        layer = "cobertes_sol")
+```
+
+```{r}
+cat_2009 <- st_read(
+  "dades/crues/cobertes_sol/cobertes-sol-v1r0-2009.gpkg",
+  layer = "cobertes_sol_categories",
+  quiet = TRUE
+)
+cat_2018 <- st_read(
+  "dades/crues/cobertes_sol/cobertes-sol-v1r0-2018.gpkg",
+  layer = "cobertes_sol_categories",
+  quiet = TRUE
+)
+cat_2019_2022 <- st_read(
+  "dades/crues/cobertes_sol/cobertes-sol-v1r0-2019-2022.gpkg",
+  layer = "cobertes_sol_categories",
+  quiet = TRUE
+)
+cat_2023 <- st_read(
+  "dades/crues/cobertes_sol/cobertes-sol-v1r0-2023.gpkg",
+  layer = "cobertes_sol_categories",
+  quiet = TRUE
+)
+```
+
+Es reclassifiquen segons el tipus de cobertura i el nivell de combustible.
+
+```{r}
+processar_cobertes <- function(entrada, path_sortida) {
+  cobertes <- entrada
+  
+  cobertes <- cobertes %>%
+    mutate(
+      TIPUS = case_when(
+        nivell_2 %in% c(111:116) ~ "Agrícola",
+        nivell_2 %in% c(221:223) ~ "Forest_tancat",
+        nivell_2 %in% c(225:227, 229) ~ "Forest_obert",
+        nivell_2 == 224 ~ "Matollar",
+        nivell_2 == 228 ~ "Herbaci",
+        nivell_2 %in% c(230:233) ~ "Sense_vegetació",
+        nivell_2 %in% c(234, 461:466) ~ "Aigua",
+        nivell_2 %in% c(341:355) ~ "Infraestructures",
+        TRUE ~ NA_character_
+      ),
+      COMBUST = case_when(
+        nivell_2 %in% c(221:224) ~ "Alta",
+        nivell_2 %in% c(225:229) ~ "Mitjana",
+        nivell_2 %in% c(111:116, 346) ~ "Baixa",
+        TRUE ~ "No_comb"
+      )
+    )
+  
+  st_write(cobertes, path_sortida, delete_layer = TRUE)
+}
+
+arxius_entrada <- list(cobertes2009, cobertes2018, cobertes2019_2022, cobertes2023)
+
+arxius_sortida <- c(
+  "dades/processades/cobertes_sol/cobertes-sol-v1r0-2009-reclas.gpkg",
+  "dades/processades/cobertes_sol/cobertes-sol-v1r0-2018-reclas.gpkg",
+  "dades/processades/cobertes_sol/cobertes-sol-v1r0-2019-2022-reclas.gpkg",
+  "dades/processades/cobertes_sol/cobertes-sol-v1r0-2023-reclas.gpkg"
+)
+
+for(i in seq_along(arxius_entrada)) {
+  processar_cobertes(arxius_entrada[[i]], arxius_sortida[i])
+}
+```
+
+## Espais naturals
+
+Es descomprimeixen i es carreguen les capes d’espais naturals, se seleccionen les variables rellevants i es guarden com a fitxers processats.
+
+```{r}
+zip_dir <- "dades/crues/espais_naturals"
+
+temp_dir <- file.path(tempdir(), "shp_unzip")
+dir.create(temp_dir, showWarnings = FALSE)
+
+zip_files <- list.files(zip_dir, pattern = "\\.zip$", full.names = TRUE)
+
+for (z in zip_files) {
+  carpeta_zip <- file.path(temp_dir, tools::file_path_sans_ext(basename(z)))
+  dir.create(carpeta_zip, showWarnings = FALSE)
+  unzip(z, exdir = carpeta_zip)
+}
+
+shp_files <- list.files(temp_dir, pattern = "\\.shp$", recursive = TRUE,
+                        full.names = TRUE)
+
+fitxer_pein <- shp_files[str_detect(shp_files, fixed("PEIN", ignore_case = TRUE))]
+pein <- st_read(fitxer_pein, quiet = TRUE)
+
+fitxer_xarnat <- shp_files[str_detect(shp_files, fixed("XARNAT_2000", ignore_case = TRUE))]
+xarnat <- st_read(fitxer_xarnat, quiet = TRUE)
+
+fitxer_enpe <- shp_files[str_detect(shp_files, fixed("ENPE", ignore_case = TRUE))]
+enpe <- st_read(fitxer_enpe, quiet = TRUE)
+```
+
+```{r}
+pein <- pein %>% select(AMBIT, AREA_HA, CODI_PEIN, NOM_PEIN, geometry)
+xarnat <- xarnat %>% select(AMBIT, AREA_HA, CODI_XN2, NOM_XN2, LIC_ZEC, ZEPA, geometry)
+enpe <- enpe %>% select(AMBIT, AREA_HA, CODI_ESPAI, NOM_ESPAI, geometry)
+```
+
+```{r}
+dir_sortida <- "dades/processades/espais_naturals/"
+if (!dir.exists(dir_sortida)) dir.create(dir_sortida, recursive = TRUE)
+
+st_write(pein, file.path(dir_sortida, "PEIN.gpkg"), delete_layer = TRUE)
+st_write(xarnat, file.path(dir_sortida, "XARNAT_2000.gpkg"), delete_layer = TRUE)
+st_write(enpe, file.path(dir_sortida, "ENPE.gpkg"), delete_layer = TRUE)
+```

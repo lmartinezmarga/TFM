@@ -1,0 +1,162 @@
+---
+title: "evolució-temporal"
+author: "Lucía Martinez Maragreto"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(sf)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(scales)
+```
+
+Es carrega la capa d’incendis.
+
+```{r}
+incendis <- st_read("dades/processades/incendis_2000_2024.gpkg")
+```
+
+Es creen taules resum per any, estació, mes i dia de la setmana, amb nombre d’incendis i hectàrees cremades.
+
+```{r}
+taula_any <- incendis %>%
+  group_by(ANY) %>%
+  summarise(
+    n_incendis = n(),
+    HA_CREMADES = sum(HA_CREMADES, na.rm = TRUE)
+  )
+
+taula_estacio <- incendis %>%
+  group_by(TEMPORADA) %>%
+  summarise(
+    n_incendis = n(),
+    HA_CREMADES = sum(HA_CREMADES, na.rm = TRUE)
+  )
+
+taula_mes <- incendis %>%
+  group_by(MES) %>%
+  summarise(
+    n_incendis = n(),
+    HA_CREMADES = sum(HA_CREMADES, na.rm = TRUE)
+  ) %>%
+  arrange(MES)
+
+taula_dia_set <- incendis %>%
+  group_by(DIA_SETMANA) %>%
+  summarise(
+    n_incendis = n(),
+    HA_CREMADES = sum(HA_CREMADES, na.rm = TRUE)
+  )
+```
+
+Es genera un conjunt de gràfics per analitzar l’evolució i distribució dels incendis segons diferents variables temporals.
+
+```{r}
+ggplot(taula_any, aes(x = ANY, y = n_incendis)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = pretty_breaks()) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Evolució anual del nombre d'incendis a Catalunya",
+       x = "Any", y = "Nombre d'incendis") +
+  theme_minimal()
+
+ggplot(taula_any, aes(x = ANY, y = HA_CREMADES)) +
+  geom_line() +
+  geom_point() +
+  scale_y_log10(labels = comma_format()) +
+  scale_x_continuous(breaks = pretty_breaks()) +
+  labs(title = "Evolució anual d'hectàrees cremades",
+       x = "Any", y = "Hectàrees cremades (escala log)") +
+  theme_minimal()
+
+ggplot(taula_estacio, aes(x = TEMPORADA, y = n_incendis)) +
+  geom_col() +
+  labs(title = "Nombre d'incendis per estació",
+       x = "Estació", y = "Nombre d'incendis") +
+  theme_minimal()
+
+ggplot(incendis, aes(x = TEMPORADA, y = HA_CREMADES)) +
+  geom_boxplot() +
+  scale_y_log10(labels = comma_format()) +
+  labs(title = "Distribució d'hectàrees cremades per estació",
+       x = "Estació", y = "Hectàrees cremades (escala log)") +
+  theme_minimal()
+
+ggplot(taula_mes, aes(x = factor(MES), y = n_incendis)) +
+  geom_col() +
+  scale_x_discrete(labels = month.abb) +
+  labs(title = "Nombre d'incendis per mes",
+       x = "Mes", y = "Nombre d'incendis") +
+  theme_minimal()
+
+ggplot(incendis, aes(x = factor(MES), y = HA_CREMADES)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = month.abb) +
+  scale_y_log10(labels = comma_format()) +
+  labs(title = "Distribució d'hectàrees cremades per mes",
+       x = "Mes", y = "Hectàrees cremades (escala log)") +
+  theme_minimal()
+
+ggplot(taula_dia_set, aes(x = DIA_SETMANA, y = n_incendis)) +
+  geom_col() +
+  labs(title = "Nombre d'incendis per dia de la setmana",
+       x = "Dia de la setmana", y = "Nombre d'incendis") +
+  theme_minimal()
+
+ggplot(incendis, aes(x = DIA_SETMANA, y = HA_CREMADES)) +
+  geom_boxplot() +
+  scale_y_log10(labels = comma_format()) +
+  labs(title = "Distribució d'hectàrees cremades per dia de la setmana",
+       x = "Dia de la setmana", y = "Hectàrees cremades (escala log)") +
+  theme_minimal()
+```
+
+Es calculen correlacions i s’apliquen tests Chi-quadrat i proves ANOVA per analitzar la relació entre variables temporals i el nombre d’incendis o les hectàrees cremades.
+
+```{r}
+cor.test(taula_any$ANY, taula_any$n_incendis)
+cor.test(taula_any$ANY, taula_any$HA_CREMADES)
+
+freq_temp <- table(incendis$TEMPORADA)
+chisq.test(freq_temp)
+
+freq_mes <- table(incendis$MES)
+chisq.test(freq_mes)
+
+freq_dia_set <- table(incendis$DIA_SETMANA)
+chisq.test(freq_dia_set)
+
+anova_estacio <- aov(log(HA_CREMADES + 1) ~ factor(TEMPORADA), data = incendis)
+summary(anova_estacio)
+
+anova_mes <- aov(log(HA_CREMADES + 1) ~ factor(MES), data = incendis)
+summary(anova_mes)
+
+anova_dia_set <- aov(log(HA_CREMADES + 1) ~ factor(DIA_SETMANA), data = incendis)
+summary(anova_dia_set)
+```
+
+```{r}
+incendis <- incendis %>% select(MUNICIPI, ANY, TEMPORADA, HA_CREMADES, geom)
+inc_centroid <- st_centroid(incendis)
+taula_any_temp <- incendis %>%
+  st_drop_geometry() %>%
+  group_by(ANY, TEMPORADA) %>%
+  summarise(
+    n_incendis = n(),
+    HA_CREMADES = sum(HA_CREMADES, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+saveRDS(incendis, "shiny/data/incendis.rds")
+saveRDS(inc_centroid, "shiny/data/centroides_incendis.rds")
+```
