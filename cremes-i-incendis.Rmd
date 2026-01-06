@@ -1,0 +1,251 @@
+---
+title: "cremes-i-incendis"
+author: "Lucía Martinez Maragreto"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(sf)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(purrr)
+library(tidyr)
+```
+
+Es carreguen les capes d’incendis i de cremes prescrites.
+
+```{r}
+inc <- st_read("dades/processades/incendis_2000_2024.gpkg")
+cremes <- st_read("dades/processades/cremes.gpkg")
+```
+
+S’extreu l’any de cada crema prescrita a partir de la data disponible per facilitar les comparacions temporals.
+
+```{r}
+cremes <- cremes %>% mutate(ANY = year(ymd(DATA_CREMA)))
+```
+
+Es defineix una funció que identifica les cremes prescrites que presenten almenys un incendi posterior dins un radi espacial i un interval temporal determinats.
+
+```{r}
+marca_incendi_post <- function(cremes_sf, inc_sf, radi_m, anys_post) {
+  
+  cremes_sf <- cremes_sf %>% mutate(ID_crema = row_number())
+  inc_sf <- inc_sf %>% mutate(ID_inc = row_number())
+  
+  cremes_buffer <- st_buffer(cremes_sf, dist = radi_m)
+  
+  inc_crema_join <- st_join(
+    inc_sf %>% select(ID_inc, ANY_inc = ANY, geom),
+    cremes_buffer %>% select(ID_crema, ANY_crema = ANY, geom),
+    join = st_intersects,
+    left = FALSE
+  )
+  
+  inc_crema_join <- inc_crema_join %>%
+    filter(ANY_inc > ANY_crema & (ANY_inc - ANY_crema) <= anys_post)
+  
+  cremes_amb_incendi <- unique(inc_crema_join$ID_crema)
+  incendi_post <- seq_len(nrow(cremes_sf)) %in% cremes_amb_incendi
+  
+  return(incendi_post)
+}
+```
+
+Es calcula el nombre i el percentatge de cremes prescrites que tenen un incendi posterior per a diferents combinacions de radi i anys posteriors.
+
+```{r}
+radis <- c(500, 1000, 2000)
+anys_post <- c(1, 2, 3)
+
+resultats <- expand.grid(radi = radis, anys = anys_post) %>%
+  rowwise() %>%
+  mutate(
+    incendi_post = list(marca_incendi_post(cremes, inc, radi_m = radi, anys_post = anys)),
+    n_cremes = sum(unlist(incendi_post)),
+    percent_cremes = 100 * n_cremes / nrow(cremes)
+  ) %>%
+  select(radi, anys, n_cremes, percent_cremes)
+
+print(resultats)
+```
+
+Es representen els percentatges de cremes amb incendi posterior en funció del radi espacial i els anys transcorreguts.
+
+```{r}
+ggplot(resultats, aes(x = factor(radi), y = factor(anys), fill = percent_cremes)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = paste0(round(percent_cremes,1), "%")), color = "black", size = 4) +
+  scale_fill_distiller(palette = "Reds", direction = 1) +
+  labs(
+    title = "Percentatge de cremes amb incendi posterior",
+    x = "Radi (m)",
+    y = "Anys posteriors",
+    fill = "% cremes amb incendi"
+  ) +
+  theme_minimal()
+```
+
+Es defineix una funció que determina si un incendi té alguna crema prescrita prèvia dins un radi i un nombre d’anys anteriors.
+
+```{r}
+incidencia_crema_previa <- function(inc_sf, cre_sf, radi_m, anys_anteriors) {
+
+  cre_sf <- st_transform(cre_sf, st_crs(inc_sf))
+
+  if(!"ANY" %in% colnames(cre_sf)) {
+    cre_sf <- cre_sf %>% mutate(ANY = year(ymd(DATA_CREMA)))
+  }
+
+  inc_buffer <- st_buffer(inc_sf, dist = radi_m)
+
+  inc_buffer <- inc_buffer %>% mutate(ID_inc = row_number())
+  cre_sf <- cre_sf %>% mutate(ID_crema = row_number())
+
+  join_sf <- st_join(inc_buffer, cre_sf, join = st_intersects, left = FALSE)
+
+  join_sf <- join_sf %>%
+    filter(ANY.y < ANY.x,
+           ANY.y >= (ANY.x - anys_anteriors))
+
+  inc_amb_crema <- unique(join_sf$ID_inc)
+
+  inc_sf$has_crema_previa <- inc_sf %>% 
+    row_number() %in% inc_amb_crema
+
+  inc_sf
+}
+```
+
+S’aplica la funció de detecció de cremes prèvies als incendis per a totes les combinacions de radi i anys considerats.
+
+```{r}
+radis <- c(500, 1000, 2000)
+anys_ant <- c(1, 2, 3)
+
+parametres <- expand.grid(
+  radi = radis,
+  anys = anys_ant
+)
+
+resultats_inc <- parametres %>%
+  mutate(
+    inc_mod = map2(
+      radi, anys,
+      ~ incidencia_crema_previa(
+        inc_sf = inc,
+        cre_sf = cremes,
+        radi_m = .x,
+        anys_anteriors = .y
+      )
+    )
+  )
+```
+
+Es calcula el percentatge d’incendis amb crema prescrita prèvia i les mitjanes d’hectàrees cremades per a cada combinació de paràmetres.
+
+```{r}
+resum_incendis <- resultats_inc %>%
+  mutate(
+    resum = map(
+      inc_mod,
+      ~ .x %>%
+        st_drop_geometry() %>%
+        summarise(
+          n_incendis = n(),
+          percent_inc_amb_crema = mean(has_crema_previa) * 100,
+          mitjana_ha_amb_crema =
+            mean(HA_CREMADES[has_crema_previa], na.rm = TRUE),
+          mitjana_ha_sense_crema =
+            mean(HA_CREMADES[!has_crema_previa], na.rm = TRUE)
+        )
+    )
+  ) %>%
+  unnest(resum)
+
+print(resum_incendis)
+```
+
+Es representen els percentatges d’incendis que han tingut una crema prescrita prèvia segons el radi i els anys anteriors.
+
+```{r}
+ggplot(resum_incendis,
+       aes(x = factor(radi),
+           y = factor(anys),
+           fill = percent_inc_amb_crema)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = paste0(round(percent_inc_amb_crema, 1), "%")),
+            size = 4) +
+  scale_fill_distiller(palette = "Reds", direction = 1) +
+  labs(
+    title = "Percentatge d'incendis amb crema prescrita prèvia",
+    x = "Radi (m)",
+    y = "Anys anteriors",
+    fill = "% incendis amb crema"
+  ) +
+  theme_minimal()
+```
+
+Es reestructuren les dades per facilitar la comparació de les hectàrees cremades mitjanes entre incendis amb crema prèvia i sense.
+
+```{r}
+dades_mitjanes <- resum_incendis %>%
+  pivot_longer(
+    cols = c(mitjana_ha_amb_crema, mitjana_ha_sense_crema),
+    names_to = "tipus",
+    values_to = "mitjana_ha"
+  ) %>%
+  mutate(
+    tipus = recode(tipus,
+                   mitjana_ha_amb_crema = "Amb crema prèvia",
+                   mitjana_ha_sense_crema = "Sense crema prèvia")
+  )
+```
+
+Es representen les mitjanes d’hectàrees cremades en funció de la presència de cremes prèvies, el radi considerat i els anys anteriors.
+
+```{r}
+ggplot(dades_mitjanes,
+       aes(x = factor(radi),
+           y = mitjana_ha,
+           fill = tipus)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ anys) +
+  scale_fill_brewer(palette = "Reds", direction = -1) +
+  labs(
+    title = "Mitjana d'hectàrees cremades segons cremes prèvies",
+    x = "Radi (m)",
+    y = "Mitjana ha cremades",
+    fill = "Tipus d'incendi"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+cremes <- cremes %>% 
+  mutate(ID = 1:nrow(.)) %>% 
+  select(ID, ANY, HECTARES, geom)
+
+radis <- c(500, 1000, 2000)
+for (r in radis) {
+  
+  cremes_buf <- cremes %>%
+    st_buffer(dist = r) %>%
+    st_simplify(dTolerance = r / 10) %>%
+    st_transform(4326)
+  
+  saveRDS(
+    cremes_buf,
+    paste0("shiny/data/cremes_buffer_", r, ".rds")
+  )
+}
+```
+
+```{r}
+saveRDS(cremes, "shiny/data/cremes.rds")
+```

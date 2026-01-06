@@ -1,0 +1,351 @@
+---
+title: "distribució-espacial"
+author: "Lucía Martinez Maragreto"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(sf)
+library(dplyr)
+library(ggplot2)
+```
+
+```{r}
+# Evita notació científica
+options(scipen=999)
+```
+
+Es carreguen les dades d’incendis, municipis, comarques i províncies per a l’anàlisi territorial.
+
+```{r}
+inc <- st_read("dades/processades/incendis_2000_2024.gpkg")
+mun <- st_read("dades/processades/divisions_admin/municipis_norm.gpkg")
+com <- st_read("dades/processades/divisions_admin/comarques_norm.gpkg")
+prov <- st_read("dades/processades/divisions_admin/provincies_norm.gpkg")
+```
+
+Es processen les geometries MULTISURFACE convertint-les a MULTIPOLYGON per garantir compatibilitat en les operacions espacials.
+
+```{r}
+convert <- function(geom) {
+  idx_ms <- which(st_geometry_type(geom) == "MULTISURFACE")
+  geom[idx_ms] <- lapply(geom[idx_ms], st_cast, "MULTIPOLYGON")
+  st_sfc(geom, crs = st_crs(geom))
+}
+
+st_geometry(mun) <- convert(st_geometry(mun))
+st_geometry(com) <- convert(st_geometry(com))
+st_geometry(prov) <- convert(st_geometry(prov))
+```
+
+Es calculen les interseccions espacials entre els incendis i les unitats territorials, així com l’àrea cremada parcial per cada intersecció (en hectàrees).
+
+```{r}
+inc$ID <- 1:nrow(inc)
+
+area_intersection <- function(inc, admin) {
+  inter <- st_intersection(inc, admin)
+  inter$HA_PART <- as.numeric(st_area(inter) / 10000)
+  inter
+}
+
+inc_mun <- area_intersection(inc, mun)
+inc_com <- area_intersection(inc, com)
+inc_prov <- area_intersection(inc, prov)
+```
+
+Es creen taules anuals amb nombre d’incendis i hectàrees cremes agregades per diferents nivells administratius.
+
+```{r}
+agg_by_admin <- function(inc_sf, admin_cols) {
+  inc_sf %>%
+    st_drop_geometry() %>%
+    group_by(across(all_of(admin_cols))) %>%
+    summarise(
+      n_incendis = n_distinct(ID),
+      HA_CREMADES = sum(HA_PART, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+inc_mun_agregat <- agg_by_admin(inc_mun, c("ANY", "CODIMUNI", "NOMMUNI")) %>%
+  left_join(mun %>% st_drop_geometry() %>% select(CODIMUNI, NOMMUNI),
+            by = c("CODIMUNI", "NOMMUNI")) %>%
+  left_join(mun %>% select(CODIMUNI, geom), by = "CODIMUNI") %>%
+  st_as_sf()
+
+inc_com_agregat <- agg_by_admin(inc_com, c("ANY", "CODICOMAR", "NOMCOMAR")) %>%
+  left_join(com %>% st_drop_geometry() %>% select(CODICOMAR, NOMCOMAR),
+            by = c("CODICOMAR", "NOMCOMAR")) %>%
+  left_join(com %>% select(CODICOMAR, geom), by = "CODICOMAR") %>%
+  st_as_sf()
+
+inc_prov_agregat <- agg_by_admin(inc_prov, c("ANY", "CODIPROV", "NOMPROV")) %>%
+  left_join(prov %>% st_drop_geometry() %>% select(CODIPROV, NOMPROV),
+            by = c("CODIPROV", "NOMPROV")) %>%
+  left_join(prov %>% select(CODIPROV, geom), by = "CODIPROV") %>%
+  st_as_sf()
+```
+
+Es resumeixen el nombre d’incendis, hectàrees cremades i percentatge cremat per les diferents divisions administratives.
+
+```{r}
+municipi_global <- inc_mun_agregat %>%
+  st_drop_geometry() %>%
+  group_by(CODIMUNI, NOMMUNI) %>%
+  summarise(
+    n_incendis = sum(n_incendis, na.rm = TRUE),
+    HA_CREMADES = sum(HA_CREMADES, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+municipi_global <- municipi_global %>%
+  left_join(
+    mun %>%
+      mutate(area = as.numeric(st_area(.)) / 10000) %>%
+      st_drop_geometry() %>%
+      select(CODIMUNI, area),
+    by = "CODIMUNI") %>%
+  mutate(pct_cremat = HA_CREMADES / area)
+
+comarca_global <- inc_com_agregat %>%
+  st_drop_geometry() %>%
+  group_by(CODICOMAR, NOMCOMAR) %>%
+  summarise(
+    n_incendis = sum(n_incendis, na.rm = TRUE),
+    HA_CREMADES = sum(HA_CREMADES, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+comarca_global <- comarca_global %>%
+  left_join(
+    com %>%
+      mutate(area = as.numeric(st_area(.)) / 10000) %>%
+      st_drop_geometry() %>%
+      select(CODICOMAR, area),
+    by = "CODICOMAR") %>%
+  mutate(pct_cremat = HA_CREMADES / area)
+
+provincia_global <- inc_prov_agregat %>%
+  st_drop_geometry() %>%
+  group_by(CODIPROV, NOMPROV) %>%
+  summarise(
+    n_incendis = sum(n_incendis, na.rm = TRUE),
+    HA_CREMADES = sum(HA_CREMADES, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+provincia_global <- provincia_global %>%
+  left_join(
+    prov %>%
+      mutate(area = as.numeric(st_area(.)) / 10000) %>%
+      st_drop_geometry() %>%
+      select(CODIPROV, area),
+    by = "CODIPROV") %>%
+  mutate(pct_cremat = HA_CREMADES / area)
+```
+
+Es generen gràfics separats amb els top 10 municipis, comarques i províncies ordenats per nombre d’incendis, hectàrees cremades i percentatge de superfície cremada.
+
+```{r}
+top_inc_mun <- municipi_global %>%
+  arrange(desc(n_incendis)) %>%
+  slice(1:10)
+
+top_ha_mun <- municipi_global %>%
+  arrange(desc(HA_CREMADES)) %>%
+  slice(1:10)
+
+top_pct_mun <- municipi_global %>%
+  arrange(desc(pct_cremat)) %>%
+  slice(1:10)
+
+ggplot(top_inc_mun, aes(x = reorder(NOMMUNI, n_incendis), y = n_incendis)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top 10 municipis per nombre d'incendis (2000–2024)",
+    x = "Municipi",
+    y = "Nombre d'incendis"
+  ) +
+  theme_minimal()
+
+ggplot(top_ha_mun, aes(x = reorder(NOMMUNI, HA_CREMADES), y = HA_CREMADES)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top 10 municipis per superfície cremada (2000–2024)",
+    x = "Municipi",
+    y = "Hectàrees cremades"
+  ) +
+  theme_minimal()
+
+ggplot(top_pct_mun, aes(x = reorder(NOMMUNI, pct_cremat), y = pct_cremat)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top 10 municipis per percentatge cremat (2000–2024)",
+    x = "Municipi",
+    y = "Percentatge cremat"
+  ) +
+  theme_minimal()
+
+top_inc_com <- comarca_global %>%
+  arrange(desc(n_incendis)) %>%
+  slice(1:10)
+
+top_ha_com <- comarca_global %>%
+  arrange(desc(HA_CREMADES)) %>%
+  slice(1:10)
+
+top_pct_com <- comarca_global %>%
+  arrange(desc(pct_cremat)) %>%
+  slice(1:10)
+
+ggplot(top_inc_com, aes(x = reorder(NOMCOMAR, n_incendis), y = n_incendis)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top 10 comarques per nombre d'incendis (2000–2024)",
+    x = "Comarca",
+    y = "Nombre d'incendis"
+  ) +
+  theme_minimal()
+
+ggplot(top_ha_com, aes(x = reorder(NOMCOMAR, HA_CREMADES), y = HA_CREMADES)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top 10 comarques per superfície cremada (2000–2024)",
+    x = "Comarca",
+    y = "Hectàrees cremades"
+  ) +
+  theme_minimal()
+
+ggplot(top_pct_com, aes(x = reorder(NOMCOMAR, pct_cremat), y = pct_cremat)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top 10 municipis per percentatge cremat (2000–2024)",
+    x = "Comarca",
+    y = "Percentatge cremat"
+  ) +
+  theme_minimal()
+
+top_inc_prov <- provincia_global %>%
+  arrange(desc(n_incendis))
+
+top_ha_prov <- provincia_global %>%
+  arrange(desc(HA_CREMADES))
+
+top_pct_prov <- provincia_global %>%
+  arrange(desc(pct_cremat))
+
+ggplot(top_inc_prov, aes(x = reorder(NOMPROV, n_incendis), y = n_incendis)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Províncies per nombre d'incendis (2000–2024)",
+    x = "Província",
+    y = "Nombre d'incendis"
+  ) +
+  theme_minimal()
+
+ggplot(top_ha_prov, aes(x = reorder(NOMPROV, HA_CREMADES), y = HA_CREMADES)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Províncies per superfície cremada (2000–2024)",
+    x = "Província",
+    y = "Hectàrees cremades"
+  ) +
+  theme_minimal()
+
+ggplot(top_pct_prov, aes(x = reorder(NOMPROV, pct_cremat), y = pct_cremat)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Províncies per percentatge cremat (2000–2024)",
+    x = "Província",
+    y = "Percentatge cremat"
+  ) +
+  theme_minimal()
+```
+
+Es mostra la correlació entre el nombre d’incendis i la superfície cremada per comarca i província.
+
+```{r}
+ggplot(comarca_global,
+       aes(x = n_incendis, y = HA_CREMADES, label = NOMCOMAR)) +
+  geom_point(alpha = 0.7) +
+  labs(
+    title = "Relació entre freqüència i superfície cremada",
+    x = "Nombre d'incendis",
+    y = "Hectàrees cremades"
+  ) +
+  theme_minimal()
+
+ggplot(provincia_global,
+       aes(x = n_incendis, y = HA_CREMADES, label = NOMPROV)) +
+  geom_point(alpha = 0.7, size = 3) +
+  labs(
+    title = "Relació entre freqüència i superfície cremada",
+    x = "Nombre d'incendis",
+    y = "Hectàrees cremades"
+  ) +
+  theme_minimal()
+```
+
+Es representen mapes temàtics de la superfície cremada per municipis, comarques i províncies.
+
+```{r}
+municipi_map <- municipi_global %>%
+  left_join(mun %>% select(CODIMUNI, geom), by = "CODIMUNI") %>%
+  st_as_sf()
+
+ggplot(municipi_map) +
+  geom_sf(aes(fill = HA_CREMADES)) +
+  scale_fill_distiller(palette = "Reds", direction = 1) +
+  labs(
+    title = "Distribució territorial de la superfície cremada per municipis (2000–2024)",
+    fill = "Hectàrees"
+  )
+
+comarca_map <- comarca_global %>%
+  left_join(com %>% select(CODICOMAR, geom), by = "CODICOMAR") %>%
+  st_as_sf()
+
+ggplot(comarca_map) +
+  geom_sf(aes(fill = HA_CREMADES)) +
+  scale_fill_distiller(palette = "Reds", direction = 1) +
+  labs(
+    title = "Distribució territorial de la superfície cremada per comarques (2000–2024)",
+    fill = "Hectàrees"
+  )
+
+provincia_map <- provincia_global %>%
+  left_join(prov %>% select(CODIPROV, geom), by = "CODIPROV") %>%
+  st_as_sf()
+
+ggplot(provincia_map) +
+  geom_sf(aes(fill = HA_CREMADES)) +
+  scale_fill_distiller(palette = "Reds", direction = 1) +
+  labs(
+    title = "Distribució territorial de la superfície cremada per províncies (2000–2024)",
+    fill = "Hectàrees"
+  )
+```
+
+```{r}
+saveRDS(mun, "shiny/data/municipis.rds")
+saveRDS(com, "shiny/data/comarques.rds")
+saveRDS(prov, "shiny/data/provincies.rds")
+
+saveRDS(inc_mun_agregat, "shiny/data/inc_mun_agregat.rds")
+saveRDS(inc_com_agregat, "shiny/data/inc_com_agregat.rds")
+saveRDS(inc_prov_agregat, "shiny/data/inc_prov_agregat.rds")
+```
