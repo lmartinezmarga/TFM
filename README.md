@@ -37,12 +37,12 @@ El repositori està organitzat de la manera següent:
     - `0-processament-dades.Rmd`
   
   - **Anàlisi**  
-    - `1-evolució-temporal.Rmd`  
-    - `2-distribució-espacial.Rmd`  
-    - `3-cremes-i-incendis.Rmd`  
-    - `4-meteorologia.Rmd`  
-    - `5-relleu.Rmd`  
-    - `6-cobertes.Rmd`  
+    - `01-evolució-temporal.Rmd`  
+    - `02-distribució-espacial.Rmd`  
+    - `03-cremes-i-incendis.Rmd`  
+    - `04-meteorologia.Rmd`  
+    - `05-relleu.Rmd`  
+    - `06-cobertes.Rmd`  
 
   Els scripts d’anàlisi parteixen de les dades ja processades i, en alguns casos, apliquen transformacions addicionals específiques per a cada estudi.
 
